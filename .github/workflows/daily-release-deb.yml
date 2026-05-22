@@ -1,0 +1,139 @@
+name: Daily Release Debian Packages
+
+on:
+  schedule:
+    - cron: "37 17 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-release-deb
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  UPSTREAM_REPOSITORY: ilysenko/codex-desktop-linux
+
+jobs:
+  sync:
+    name: Sync upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      commit: ${{ steps.sync.outputs.commit }}
+      pkg_version: ${{ steps.meta.outputs.pkg_version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Sync from upstream
+        id: sync
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch upstream main
+          git checkout -B main
+
+          if ! git rebase upstream/main; then
+            echo "Upstream sync produced conflicts while rebasing fork changes. Resolve them in the fork, then rerun this workflow." >&2
+            exit 1
+          fi
+
+          git push --force-with-lease origin HEAD:main
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+
+          pkg_version="$(date -u +'%Y.%m.%d.%H%M%S')"
+          release_tag="release-$(date -u +'%Y%m%d-%H%M%S')"
+
+          {
+            echo "pkg_version=$pkg_version"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build-deb:
+    name: Build ${{ matrix.deb_arch }} deb
+    needs: sync
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - deb_arch: amd64
+            runner: ubuntu-24.04
+          - deb_arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout synced fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install build dependencies
+        run: bash scripts/install-deps.sh
+
+      - name: Build app from fresh upstream DMG
+        run: make build-app-fresh
+
+      - name: Build Debian package
+        run: PACKAGE_VERSION="${{ needs.sync.outputs.pkg_version }}" make deb
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-desktop-${{ matrix.deb_arch }}-deb
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs:
+      - sync
+      - build-deb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Download Debian package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Verify release assets
+        run: |
+          set -euo pipefail
+          find release -maxdepth 1 -type f -name '*.deb' -print | sort
+          test "$(find release -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 2
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.sync.outputs.release_tag }}
+          TARGET_COMMIT: ${{ needs.sync.outputs.commit }}
+          PACKAGE_VERSION: ${{ needs.sync.outputs.pkg_version }}
+        run: |
+          set -euo pipefail
+
+          gh release create "$RELEASE_TAG" release/*.deb \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_COMMIT" \
+            --title "$PACKAGE_VERSION" \
+            --notes "Automated Debian/Ubuntu .deb build for amd64 and arm64."
