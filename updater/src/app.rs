@@ -5,7 +5,7 @@ use crate::{
     cli::{Cli, Commands},
     codex_cli,
     config::{RuntimeConfig, RuntimePaths},
-    install, install_rollback, liveness, logging, notify, rollback,
+    install, install_rollback, liveness, logging, notify, release, rollback,
     state::{CliStatus, PersistedState, UpdateStatus},
     upstream,
 };
@@ -573,6 +573,39 @@ async fn run_check_cycle(
     persist_state(paths, state)?;
 
     let result: Result<()> = async {
+        if install::PackageKind::detect() == install::PackageKind::Deb {
+            if let Some(release_api_url) = config
+                .deb_release_api_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+            {
+                match release::fetch_latest_deb_asset(&client, release_api_url).await {
+                    Ok(Some(asset)) => {
+                        return prepare_release_deb_update(config, state, paths, &client, &asset)
+                            .await;
+                    }
+                    Ok(None) => {
+                        info!(
+                            release_api_url,
+                            "no matching Debian Release asset found; no update detected"
+                        );
+                        mark_no_release_update(state, paths, true)?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            release_api_url,
+                            "failed to check GitHub Release asset; no update detected"
+                        );
+                        mark_no_release_update(state, paths, false)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let metadata = upstream::fetch_remote_metadata(&client, &config.dmg_url).await?;
         let previous_headers_fingerprint = state.remote_headers_fingerprint.clone();
         state.remote_headers_fingerprint = Some(metadata.headers_fingerprint.clone());
@@ -658,6 +691,133 @@ async fn run_check_cycle(
         return Err(error);
     }
 
+    Ok(())
+}
+
+fn mark_no_release_update(
+    state: &mut PersistedState,
+    paths: &RuntimePaths,
+    successful_check: bool,
+) -> Result<()> {
+    state.status = UpdateStatus::Idle;
+    state.candidate_version = None;
+    if successful_check {
+        state.last_successful_check_at = Some(Utc::now());
+    }
+    state.error_message = None;
+    state.artifact_paths.dmg_path = None;
+    state.artifact_paths.workspace_dir = None;
+    state.artifact_paths.package_path = None;
+    persist_state(paths, state)
+}
+
+async fn prepare_release_deb_update(
+    config: &RuntimeConfig,
+    state: &mut PersistedState,
+    paths: &RuntimePaths,
+    client: &Client,
+    asset: &release::ReleaseDebAsset,
+) -> Result<()> {
+    let previous_headers_fingerprint = state.remote_headers_fingerprint.clone();
+    state.remote_headers_fingerprint = Some(asset.fingerprint.clone());
+    state.last_successful_check_at = Some(Utc::now());
+
+    if state
+        .rollback_blocked_candidate_version
+        .as_deref()
+        .is_some_and(|blocked| {
+            installed_version_matches_candidate(blocked, &asset.candidate_version)
+        })
+    {
+        state.status = UpdateStatus::Idle;
+        state.error_message = Some(format!(
+            "Candidate {} was rolled back and will not be reinstalled automatically",
+            asset.candidate_version
+        ));
+        persist_state(paths, state)?;
+        info!(
+            candidate_version = %asset.candidate_version,
+            "skipping GitHub Release candidate blocked by rollback"
+        );
+        return Ok(());
+    }
+
+    if installed_version_satisfies_candidate(&state.installed_version, &asset.candidate_version) {
+        state.status = UpdateStatus::Idle;
+        state.candidate_version = None;
+        state.error_message = None;
+        persist_state(paths, state)?;
+        info!(
+            installed_version = %state.installed_version,
+            candidate_version = %asset.candidate_version,
+            "installed package already satisfies latest GitHub Release asset"
+        );
+        return Ok(());
+    }
+
+    if previous_headers_fingerprint.as_deref() == Some(asset.fingerprint.as_str())
+        && state.dmg_sha256.is_some()
+        && state.status != UpdateStatus::Failed
+        && state
+            .candidate_version
+            .as_deref()
+            .is_some_and(|candidate| candidate == asset.candidate_version)
+        && state
+            .artifact_paths
+            .package_path
+            .as_deref()
+            .is_some_and(Path::exists)
+    {
+        state.status = UpdateStatus::ReadyToInstall;
+        state.error_message = None;
+        persist_state(paths, state)?;
+        maybe_notify_update_ready(state, paths, config.notifications)?;
+        info!(
+            release_tag = %asset.release_tag,
+            asset_name = %asset.asset_name,
+            "GitHub Release asset unchanged; cached package is ready"
+        );
+        return Ok(());
+    }
+
+    set_status(state, paths, UpdateStatus::DownloadingDmg)?;
+    let downloads_dir = config.workspace_root.join("downloads");
+    let downloaded = release::download_deb_asset(client, asset, &downloads_dir).await?;
+
+    if state.dmg_sha256.as_deref() == Some(downloaded.sha256.as_str())
+        && state
+            .candidate_version
+            .as_deref()
+            .is_some_and(|candidate| candidate == asset.candidate_version)
+        && state.status != UpdateStatus::Failed
+    {
+        state.status = UpdateStatus::Idle;
+        state.artifact_paths.package_path = Some(downloaded.path);
+        persist_state(paths, state)?;
+        info!("downloaded GitHub Release package hash matches current cached package; no update detected");
+        return Ok(());
+    }
+
+    rollback::record_current_package_as_known_good(state);
+    state.status = UpdateStatus::ReadyToInstall;
+    state.candidate_version = Some(asset.candidate_version.clone());
+    state.dmg_sha256 = Some(downloaded.sha256);
+    state.artifact_paths.package_path = Some(downloaded.path);
+    state.artifact_paths.dmg_path = None;
+    state.artifact_paths.workspace_dir = None;
+    state.notified_events.clear();
+    state.error_message = None;
+    state.save(&paths.state_file)?;
+
+    maybe_notify_update_ready(state, paths, config.notifications)?;
+    info!(
+        release_tag = %asset.release_tag,
+        release_name = asset.release_name.as_deref().unwrap_or(""),
+        asset_name = %asset.asset_name,
+        candidate_version = %asset.candidate_version,
+        asset_size = asset.size.unwrap_or(0),
+        "GitHub Release Debian package update ready"
+    );
     Ok(())
 }
 
@@ -1228,10 +1388,15 @@ fn notify_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     #[test]
     fn upstream_check_freshness_respects_configured_interval() {
         let config = RuntimeConfig {
+            deb_release_api_url: None,
             dmg_url: "https://example.com/Codex.dmg".to_string(),
             initial_check_delay_seconds: 1,
             check_interval_hours: 6,
@@ -1289,6 +1454,7 @@ mod tests {
         std::fs::write(&package_path, b"deb")?;
 
         let config = RuntimeConfig {
+            deb_release_api_url: None,
             dmg_url: "https://example.com/Codex.dmg".to_string(),
             initial_check_delay_seconds: 1,
             check_interval_hours: 6,
@@ -1326,6 +1492,7 @@ mod tests {
         paths.ensure_dirs()?;
 
         let config = RuntimeConfig {
+            deb_release_api_url: None,
             dmg_url: "https://invalid.example/Codex.dmg".to_string(),
             initial_check_delay_seconds: 1,
             check_interval_hours: 6,
@@ -1350,6 +1517,127 @@ mod tests {
             assert_eq!(state.last_check_at, None);
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deb_release_check_failure_does_not_fallback_to_dmg() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = RuntimePaths {
+            config_file: temp.path().join("config/config.toml"),
+            state_file: temp.path().join("state/state.json"),
+            log_file: temp.path().join("state/service.log"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            config_dir: temp.path().join("config"),
+        };
+        paths.ensure_dirs()?;
+
+        let release_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/zyycn/codex-desktop-linux/releases/latest"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&release_server)
+            .await;
+
+        let dmg_server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/Codex.dmg"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&dmg_server)
+            .await;
+
+        let config = RuntimeConfig {
+            deb_release_api_url: Some(format!(
+                "{}/repos/zyycn/codex-desktop-linux/releases/latest",
+                release_server.uri()
+            )),
+            dmg_url: format!("{}/Codex.dmg", dmg_server.uri()),
+            initial_check_delay_seconds: 1,
+            check_interval_hours: 6,
+            auto_install_on_app_exit: true,
+            notifications: false,
+            workspace_root: temp.path().join("cache"),
+            builder_bundle_root: temp.path().join("builder"),
+            app_executable_path: temp.path().join("not-running-electron"),
+        };
+
+        let mut state = PersistedState::new(true);
+
+        run_check_cycle(&config, &mut state, &paths).await?;
+
+        assert_eq!(state.status, UpdateStatus::Idle);
+        assert_eq!(state.candidate_version, None);
+        assert_eq!(state.artifact_paths.dmg_path, None);
+        assert_eq!(state.artifact_paths.package_path, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deb_release_without_matching_asset_does_not_fallback_to_dmg() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = RuntimePaths {
+            config_file: temp.path().join("config/config.toml"),
+            state_file: temp.path().join("state/state.json"),
+            log_file: temp.path().join("state/service.log"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            config_dir: temp.path().join("config"),
+        };
+        paths.ensure_dirs()?;
+
+        let release_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/zyycn/codex-desktop-linux/releases/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tag_name": "release-20260524-010000",
+                "name": "2026.05.24.010000",
+                "assets": [
+                    {
+                        "name": "codex-desktop_2026.05.24.010000_riscv64.deb",
+                        "browser_download_url": "https://example.com/riscv64.deb",
+                        "size": 1
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&release_server)
+            .await;
+
+        let dmg_server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/Codex.dmg"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&dmg_server)
+            .await;
+
+        let config = RuntimeConfig {
+            deb_release_api_url: Some(format!(
+                "{}/repos/zyycn/codex-desktop-linux/releases/latest",
+                release_server.uri()
+            )),
+            dmg_url: format!("{}/Codex.dmg", dmg_server.uri()),
+            initial_check_delay_seconds: 1,
+            check_interval_hours: 6,
+            auto_install_on_app_exit: true,
+            notifications: false,
+            workspace_root: temp.path().join("cache"),
+            builder_bundle_root: temp.path().join("builder"),
+            app_executable_path: temp.path().join("not-running-electron"),
+        };
+
+        let mut state = PersistedState::new(true);
+
+        run_check_cycle(&config, &mut state, &paths).await?;
+
+        assert_eq!(state.status, UpdateStatus::Idle);
+        assert_eq!(state.candidate_version, None);
+        assert_eq!(state.artifact_paths.dmg_path, None);
+        assert_eq!(state.artifact_paths.package_path, None);
+        assert!(state.last_successful_check_at.is_some());
         Ok(())
     }
 
@@ -1426,6 +1714,7 @@ mod tests {
         paths.ensure_dirs()?;
 
         let config = RuntimeConfig {
+            deb_release_api_url: None,
             dmg_url: "https://example.com/Codex.dmg".to_string(),
             initial_check_delay_seconds: 1,
             check_interval_hours: 6,
@@ -1473,6 +1762,7 @@ mod tests {
         std::fs::write(&package_path, b"deb")?;
 
         let config = RuntimeConfig {
+            deb_release_api_url: None,
             dmg_url: "https://example.com/Codex.dmg".to_string(),
             initial_check_delay_seconds: 1,
             check_interval_hours: 6,
@@ -1517,6 +1807,7 @@ mod tests {
         std::fs::write(&package_path, b"deb")?;
 
         let config = RuntimeConfig {
+            deb_release_api_url: None,
             dmg_url: "https://example.com/Codex.dmg".to_string(),
             initial_check_delay_seconds: 1,
             check_interval_hours: 6,
@@ -1556,6 +1847,7 @@ mod tests {
         paths.ensure_dirs()?;
 
         let config = RuntimeConfig {
+            deb_release_api_url: None,
             dmg_url: "https://example.com/Codex.dmg".to_string(),
             initial_check_delay_seconds: 1,
             check_interval_hours: 6,
