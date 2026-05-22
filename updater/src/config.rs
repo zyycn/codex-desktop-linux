@@ -11,6 +11,8 @@ const SERVICE_NAME: &str = "codex-update-manager";
 /// Runtime configuration values that control how the updater behaves on Linux.
 pub struct RuntimeConfig {
     pub dmg_url: String,
+    #[serde(default = "default_deb_release_api_url")]
+    pub deb_release_api_url: Option<String>,
     pub initial_check_delay_seconds: u64,
     pub check_interval_hours: u64,
     pub auto_install_on_app_exit: bool,
@@ -84,6 +86,7 @@ impl RuntimeConfig {
 
         Self {
             dmg_url: "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg".to_string(),
+            deb_release_api_url: default_deb_release_api_url(),
             initial_check_delay_seconds: 30,
             check_interval_hours: 6,
             auto_install_on_app_exit: true,
@@ -106,6 +109,10 @@ impl RuntimeConfig {
             .with_context(|| format!("Failed to parse {}", paths.config_file.display()))?;
         Ok(config)
     }
+}
+
+fn default_deb_release_api_url() -> Option<String> {
+    Some("https://api.github.com/repos/zyycn/codex-desktop-linux/releases/latest".to_string())
 }
 
 #[cfg(test)]
@@ -150,6 +157,7 @@ mod tests {
             &paths.config_file,
             r#"
 dmg_url = "https://example.com/Codex.dmg"
+deb_release_api_url = "https://api.github.com/repos/example/codex-desktop-linux/releases/latest"
 initial_check_delay_seconds = 5
 check_interval_hours = 12
 auto_install_on_app_exit = false
@@ -162,6 +170,10 @@ app_executable_path = "/opt/codex-desktop/electron"
 
         let config = RuntimeConfig::load_or_default(&paths)?;
         assert_eq!(config.dmg_url, "https://example.com/Codex.dmg");
+        assert_eq!(
+            config.deb_release_api_url.as_deref(),
+            Some("https://api.github.com/repos/example/codex-desktop-linux/releases/latest")
+        );
         assert_eq!(config.initial_check_delay_seconds, 5);
         assert_eq!(config.check_interval_hours, 12);
         assert!(!config.auto_install_on_app_exit);
@@ -178,6 +190,37 @@ app_executable_path = "/opt/codex-desktop/electron"
             config.app_executable_path,
             PathBuf::from("/opt/codex-desktop/electron")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn defaults_release_api_for_legacy_config_files() -> Result<()> {
+        let temp = tempdir()?;
+        let paths = RuntimePaths {
+            config_file: temp.path().join("config/config.toml"),
+            state_file: temp.path().join("state/state.json"),
+            log_file: temp.path().join("state/service.log"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            config_dir: temp.path().join("config"),
+        };
+        fs::create_dir_all(&paths.config_dir)?;
+        fs::write(
+            &paths.config_file,
+            r#"
+dmg_url = "https://example.com/Codex.dmg"
+initial_check_delay_seconds = 5
+check_interval_hours = 12
+auto_install_on_app_exit = false
+notifications = false
+workspace_root = "/tmp/codex-workspaces"
+builder_bundle_root = "/tmp/codex-builder"
+app_executable_path = "/opt/codex-desktop/electron"
+"#,
+        )?;
+
+        let config = RuntimeConfig::load_or_default(&paths)?;
+        assert_eq!(config.deb_release_api_url, default_deb_release_api_url());
         Ok(())
     }
 }

@@ -675,6 +675,7 @@ fi
         paths.ensure_dirs()?;
 
         let config = RuntimeConfig {
+            deb_release_api_url: None,
             dmg_url: "https://example.com/Codex.dmg".to_string(),
             initial_check_delay_seconds: 30,
             check_interval_hours: 6,
